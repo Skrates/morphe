@@ -1,12 +1,15 @@
 # Weekly one-pass skill audit. Skills are exempt from the per-PR review loop
 # (Hákon's ruling, 2026-08-21: prose review of a skill never converges — it
 # breeds finding streams, not quality). This wake is their entire quality
-# gate: one seat, one pass over the week's skill changes, repairs landed as
-# direct commits or follow-up tickets, no re-review and no burn rounds.
+# gate: one seat, one pass over skill changes in the audit window, repairs
+# landed as direct commits or follow-up tickets, no re-review and no burn
+# rounds. The helper watermarks that window from the previous successful
+# run of this workflow, so a delayed or dropped schedule cannot leave skill
+# commits between two consecutive windows.
 #
 # Adopt alongside review-loop.yml (same HIVE_BOT_TOKEN secret). The audit
 # seat defaults to theoros; recast with the SKILL_AUDIT_ACTOR repository
-# variable, never a code edit. A week with no skill-corpus commits posts
+# variable, never a code edit. A window with no skill-corpus commits posts
 # nothing.
 name: skill-audit
 
@@ -25,6 +28,7 @@ env:
 
 permissions:
   contents: read
+  actions: read
 
 jobs:
   wake-skill-audit:
@@ -39,9 +43,10 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
 
-      - name: Wake the audit seat if skills changed this week
+      - name: Wake the audit seat if skills changed in the audit window
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
           LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
         run: python3 .github/scripts/review_loop.py skill-audit
