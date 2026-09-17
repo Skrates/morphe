@@ -188,7 +188,7 @@ jobs:
       # The Estate's one public toolchain pin: the action's own mise.toml names
       # the uv/ruff/ty versions, and this workflow names only the action commit.
       # Public repos run GitHub-hosted so fork PRs never execute on Weave metal.
-      - uses: Skrates/agent-affordances/toolchain@60b726964a3a8137295595c17c4c736be2f898f9
+      - uses: Skrates/agent-affordances/toolchain@5613475f9d2d50d23b97e32669858f7f24a727d1
         with:
           tools: uv ruff ty
 
