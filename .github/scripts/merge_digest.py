@@ -27,7 +27,7 @@ account in front of him while a revert is still one command.
 The gate half of every entry is read through ``review_loop`` — the same
 resolution the review-loop hook publishes.  Two audit trails that can disagree
 are worse than one, so this file contains no second implementation of exact-head
-verdict resolution, finding counts, or round numbering.
+verdict resolution, finding counts, round numbering, or exhaustion.
 
 Standard library only, like its sibling: the cx53 self-hosted runners have a
 deliberately small tool surface.
@@ -53,10 +53,8 @@ REPOS_FILE = REPO_ROOT / "weave-repos.json"
 DIGEST_WORKFLOW_FILE = "merge-digest.yml"
 DIGEST_DRY_RUN_MARKER = "dry-run"
 BOOTSTRAP_WINDOW_HOURS = 24
-SUBSTANCE_FLOOR = 180
 MAX_SUBSTANCE = 900
 MAX_AREAS = 4
-MAX_RESIDUE_LINES = 3
 DIGEST_CHUNK_BUDGET = 12000
 LINEAR_ISSUE_URL = "https://linear.app/krates-ehf/issue/"
 TICKET_PATTERN = re.compile(r"\bKRA-\d+\b")
@@ -66,22 +64,6 @@ BOILERPLATE_PATTERN = re.compile(
     r"(?im)^\s*(?:closes|fixes|resolves)\s+KRA-\d+\s*$"
     r"|^\s*(?:co-authored-by|generated with|🤖).*$"
     r"|^\s*<?https?://\S*claude\.com/claude-code>?\s*$"
-)
-RESIDUE_VOCABULARY = (
-    "trade-off",
-    "tradeoff",
-    "residue",
-    "deliberate choice",
-    "known gap",
-    "known limitation",
-    "follow-up",
-    "follow up",
-    "out of scope",
-    "not addressed",
-    "caveat",
-    "judgement call",
-    "judgment call",
-    "design call",
 )
 SECRET_PATTERNS = (
     re.compile(r"xox[baprs]-[A-Za-z0-9-]{10,}"),
@@ -344,15 +326,8 @@ def merged_pulls_since(github: GitHubApi, since: datetime) -> list[Mapping[str, 
         page += 1
 
 
-def substance(body: str) -> tuple[str, bool]:
-    """The account of what changed, taken from the pull body.
-
-    A digest entry exists to say what is now true of the system that was not
-    true before.  Nothing mechanical can write that; the author already did, in
-    the body.  What this can do honestly is carry it across, and say so out loud
-    when there is too little of it to be cold-readable rather than pass a title
-    off as an account.
-    """
+def substance(body: str) -> str:
+    """The account of what changed, taken from the pull body."""
     text = HTML_COMMENT_PATTERN.sub("", body or "")
     lines: list[str] = []
     for raw in text.splitlines():
@@ -366,28 +341,12 @@ def substance(body: str) -> tuple[str, bool]:
         lines.append(line)
     prose = "\n".join(lines).strip()
     prose = re.sub(r"\n{3,}", "\n\n", prose)
-    measured = len(re.sub(r"\s+", " ", re.sub(r"[*_`>#-]", "", prose)).strip())
     if len(prose) > MAX_SUBSTANCE:
         cut = prose.rfind("\n", 0, MAX_SUBSTANCE)
         if cut < MAX_SUBSTANCE // 2:
             cut = MAX_SUBSTANCE
         prose = f"{prose[:cut].rstrip()}\n…(body continues)"
-    return prose, measured < SUBSTANCE_FLOOR
-
-
-def residue_lines(body: str) -> list[str]:
-    """Lines where the author flagged a trade-off, a known gap, or a follow-up."""
-    found: list[str] = []
-    for raw in HTML_COMMENT_PATTERN.sub("", body or "").splitlines():
-        line = raw.strip().lstrip("*-• ").strip()
-        if not line or BOILERPLATE_PATTERN.match(raw):
-            continue
-        lowered = line.lower()
-        if any(word in lowered for word in RESIDUE_VOCABULARY):
-            found.append(line if len(line) <= 220 else f"{line[:219]}…")
-        if len(found) >= MAX_RESIDUE_LINES:
-            break
-    return found
+    return prose
 
 
 def ticket_refs(body: str, title: str) -> list[str]:
@@ -498,13 +457,12 @@ def gate_report(
     number = int(pull["number"])
     merged_head = str((pull.get("head") or {}).get("sha") or "").lower()
     # Pre-merge evidence only: a later verdict cannot rewrite the gate record.
-    # The cut is ``review_loop.at_closure`` — the same one the belt summary
-    # measures its own closure with, so the digest and the belt cannot report
-    # different histories for one PR.
+    # Reviews go through ``reviews_as_of_closure`` (REST has no ``updated_at``;
+    # GraphQL ``lastEditedAt`` fills it). Issue and inline comments go through
+    # ``at_closure`` directly. Both readers share those helpers, so the digest
+    # and the belt cannot report different histories for one PR.
     merged_at = str(pull.get("merged_at") or "")
-    reviews = review_loop.at_closure(
-        github.paginate(f"pulls/{number}/reviews"), merged_at, "submitted_at"
-    )
+    reviews = review_loop.reviews_as_of_closure(github, number, merged_at)
     review_comments = review_loop.at_closure(
         github.paginate(f"pulls/{number}/comments"), merged_at, "created_at"
     )
@@ -534,18 +492,10 @@ def gate_report(
     burned = sum(
         row["counts"]["total"] for row in history if row["head"] != merged_head
     )
-    # The merged head is checked explicitly: a fourth unreviewed head merged by
-    # human override never appears in ``history`` (it has no Codex result
-    # event), yet its exhaustion marker is precisely the gate fact to report.
-    marker_heads = {row["head"] for row in history} | (
-        {merged_head} if merged_head else set()
-    )
-    exhausted = any(
-        review_loop.marker_comment_exists(
-            issue_comments, review_loop.exhaustion_marker(head)
-        )
-        for head in marker_heads
-    )
+    # Same predicate as ``pr_belt_summary``: any trusted marker the helper
+    # still recognises (legacy form, or a versioned marker under an earlier
+    # round bound). Regenerating today's writer form here is a second reader.
+    exhausted = review_loop.exhaustion_gate_recorded(issue_comments)
     return {
         "merged_head": merged_head,
         "rounds": len(history),
@@ -1169,7 +1119,7 @@ def build_entry(
     span = merge_span(github, pull)
     merge_sha = span.sha
     files = github.paginate(f"pulls/{number}/files")
-    account, thin = substance(body)
+    account = substance(body)
     gate = gate_report(github, pull, codex_login)
     checks = (
         check_report(github, merge_sha)
@@ -1214,10 +1164,8 @@ def build_entry(
         "merged_by": str(merged_by),
         "seat": "",
         "account": account,
-        "thin": thin,
         "shape": change_shape(files),
         "tickets": ticket_refs(body, title),
-        "residue": residue_lines(body),
         "gate": gate,
         "checks": checks,
         "reversal": reversal,
@@ -1247,12 +1195,6 @@ def render_entry(entry: Mapping[str, Any], index: int) -> str:
         f"*{index}. <{entry['url']}|{entry['slug']}#{entry['number']}>* — {entry['title']}",
         entry["account"] if entry["account"] else "_(empty body)_",
     ]
-    if entry["thin"]:
-        lines.append(
-            "⚠️ *This body is too thin to be cold-readable.* The digest cannot "
-            "manufacture the account the author did not write — open the PR to "
-            "judge this one."
-        )
     lines.append(f"• *Ticket:* {ticket_links(entry['tickets'])}")
     lines.append(f"• *Shape:* {entry['shape']}")
     lines.append(f"• *Gated by:* {gate_line(entry['gate'])}")
@@ -1261,8 +1203,6 @@ def render_entry(entry: Mapping[str, Any], index: int) -> str:
     seat = f", authored by {entry['seat']}" if entry["seat"] else ""
     lines.append(f"• *Merged:* {merged} by `{entry['merged_by']}`{seat}")
     lines.append(f"• *Reversing it now:* {entry['reversal']['detail']}")
-    for residue in entry["residue"]:
-        lines.append(f"• *Author flagged:* {residue}")
     lines.append(f"• *Veto:* reply `VETO {entry['slug']}#{entry['number']} — <reason>`")
     return "\n".join(lines) + "\n"
 
@@ -1339,7 +1279,7 @@ def run_digest(*, dry_run: bool = False, since_override: str | None = None) -> N
     token = required_env("WEAVE_DIGEST_TOKEN")
     codex_login = os.environ.get("CODEX_LOGIN", review_loop.CODEX_LOGIN)
     now = datetime.now(timezone.utc)
-    self_repo = os.environ.get("GITHUB_REPOSITORY", "RationallyPrime/weave-doctrine")
+    self_repo = os.environ.get("GITHUB_REPOSITORY", "Skrates/weave-doctrine")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     parsed_override: datetime | None = None
     if since_override:
@@ -1440,11 +1380,6 @@ def announce_message(entry: Mapping[str, Any]) -> str:
         f"{entry['title']}"
     )
     lines = [headline, entry["account"] if entry["account"] else "_(empty body)_"]
-    if entry["thin"]:
-        lines.append(
-            "⚠️ *Thin body* — this merge landed without a cold-readable account "
-            "of what it does."
-        )
     lines.append(f"• *Ticket:* {ticket_links(entry['tickets'])}")
     lines.append(f"• *Gated by:* {gate_line(entry['gate'])}")
     lines.append(f"• *Checks at the merge commit:* {check_line(entry['checks'])}")
@@ -1453,8 +1388,6 @@ def announce_message(entry: Mapping[str, Any]) -> str:
         f"• *Merged:* {merged} by `{entry['merged_by']}`, authored by {entry['seat']}"
     )
     lines.append(f"• *Revert anchor:* {entry['reversal']['detail']}")
-    for residue in entry["residue"]:
-        lines.append(f"• *Author flagged:* {residue}")
     lines.append(
         f"• *Veto:* reply `VETO {entry['slug']}#{entry['number']} — <reason>`. "
         "The veto never expires; only its price rises."
