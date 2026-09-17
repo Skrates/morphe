@@ -119,6 +119,17 @@ env:
   AI_USAGE_CODEX_THRESHOLD: ${{ vars.AI_USAGE_CODEX_THRESHOLD }}
   REVIEW_SUBSTITUTE_ACTOR: ${{ vars.REVIEW_SUBSTITUTE_ACTOR }}
   REVIEW_BURN_ACTOR: ${{ vars.REVIEW_BURN_ACTOR }}
+  # The burn cast is a roster the usage meter reads (2026-09-07): seats in
+  # preference order, first available wins; unset => the single cast above.
+  REVIEW_BURN_ROSTER: ${{ vars.REVIEW_BURN_ROSTER }}
+  REVIEW_BURN_THRESHOLD: ${{ vars.REVIEW_BURN_THRESHOLD }}
+  REVIEW_SEAT_USAGE_PROFILES: ${{ vars.REVIEW_SEAT_USAGE_PROFILES }}
+  # Burn wakes carry the edge's `Effort:` overlay: PR label `effort:<tier>`
+  # wins, else this repository default; unset => no overlay line.
+  REVIEW_BURN_EFFORT: ${{ vars.REVIEW_BURN_EFFORT }}
+  # The retrospective seat is a cast too; `none` holds the third hook
+  # (Hákon's ruling, 2026-09-07). Unset => theoros.
+  REVIEW_RETROSPECTIVE_ACTOR: ${{ vars.REVIEW_RETROSPECTIVE_ACTOR }}
   # Optional `Git Author Name=seat` overlay. Two home cases: a non-seat
   # author (the commits land under a human identity) and GitHub's
   # "Update branch" merge commit (HEAD is the clicker's git name, so the
@@ -170,6 +181,8 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           HIVE_BOT_TOKEN: ${{ secrets.HIVE_BOT_TOKEN }}
+          # The burn cast reads the usage meter; absent => the static cast.
+          AI_USAGE_READ_TOKEN: ${{ secrets.AI_USAGE_READ_TOKEN }}
           LOGFIRE_TOKEN: ${{ secrets.LOGFIRE_TOKEN }}
         run: python3 .github/scripts/review_loop.py route
 
@@ -265,7 +278,12 @@ jobs:
     # A merged fork PR carries no secrets on this event and so cannot be
     # announced here; the scheduled cross-repo digest reads it with its own
     # token, and is the completeness backstop for exactly that case.
-    if: github.event_name == 'pull_request' && github.event.pull_request.merged == true
+    # Same-repository heads only: a fork `pull_request` run has empty
+    # secrets, so `merge_digest.py announce` would red on required_env
+    # instead of deferring to that backstop.
+    if: >-
+      github.event_name == 'pull_request' && github.event.pull_request.merged == true
+      && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ${{ fromJSON(github.event.repository.private && '["self-hosted","cx53"]' || '["ubuntu-latest"]') }}
     steps:
       - name: Checkout trusted digest helper

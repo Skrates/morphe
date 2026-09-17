@@ -594,6 +594,26 @@ DEFAULT_BURN_ACTOR = "talos"
 # repository fills.  One constant so the wake and the chase that follows it
 # cannot address different seats.
 RETROSPECTIVE_ACTOR = "theoros"
+# ...and yet the SEAT is a cast (Hákon's ruling, 2026-09-07): for the
+# thirteen-lanes crunch Theoros's exhaustion testimony is on hold, so
+# ``REVIEW_RETROSPECTIVE_ACTOR`` names the seat (default: the constant above)
+# or one of ``RETROSPECTIVE_HOLD_VALUES`` to post the gate and wake nobody.
+RETROSPECTIVE_ACTOR_ENV = "REVIEW_RETROSPECTIVE_ACTOR"
+RETROSPECTIVE_HOLD_VALUES = frozenset({"none", "held", "off"})
+# The burn cast became a roster the same day (Talos dry for a day while the
+# belt kept minting to it): ``REVIEW_BURN_ROSTER`` lists, in preference
+# order, every seat that may burn, and the usage meter casts the first one
+# whose pool reads available (the vendored seat-router below).  Unset, the
+# single ``REVIEW_BURN_ACTOR`` cast stands, byte for byte.
+BURN_ROSTER_ENV = "REVIEW_BURN_ROSTER"
+BURN_THRESHOLD_ENV = "REVIEW_BURN_THRESHOLD"
+SEAT_USAGE_PROFILES_ENV = "REVIEW_SEAT_USAGE_PROFILES"
+# A burn wake carries the edge's per-delivery effort overlay (hive#49): a
+# PR label ``effort:<tier>`` wins, else ``REVIEW_BURN_EFFORT``; the tier
+# vocabulary is the union of the provider ladders and the edge clamps.
+BURN_EFFORT_ENV = "REVIEW_BURN_EFFORT"
+EFFORT_LABEL_PREFIX = "effort:"
+WAKE_EFFORT_TIERS = ("low", "medium", "high", "xhigh", "max", "ultra")
 FINDING_IDENTITY_MAX = 96
 _IDENTITY_NOISE = re.compile(
     r"</?sub>|!\[[^\]]*\]\([^)]*\)|\[P[123]-[A-Za-z]+\]|\*{1,2}|_{1,2}"
@@ -717,13 +737,42 @@ EXEMPT_PATHS_ENV = "REVIEW_LOOP_EXEMPT_PATHS"
 # per repository and must not have the helper re-read one it already dated.
 EXEMPT_PATHS_SINCE_ENV = "REVIEW_LOOP_EXEMPT_PATHS_SINCE"
 DEFAULT_SKILL_AUDIT_ACTOR = "theoros"
-SKILL_AUDIT_WINDOW_DAYS = 7
+SKILL_AUDIT_WORKFLOW_FILE = "skill-audit.yml"
+# First-run / missing-workflow lookback. Consecutive runs watermark from the
+# previous successful run of this workflow, so a delayed schedule cannot leave
+# skill commits between two windows; 14 days is only the bootstrap overlap.
+SKILL_AUDIT_FALLBACK_DAYS = 14
 # How far back the scheduled terminal sweep looks for fork closures the
 # ``pull_request`` event could not export.  Wider than any plausible schedule
 # gap on purpose: re-emitting a closure already exported is free (the span
 # carries the closure's own id and every query groups on it), while missing one
 # is a permanent hole in the distribution.
 BELT_SWEEP_WINDOW_HOURS = 168
+# REST pull-request reviews have ``submitted_at`` and no ``updated_at``.
+# GraphQL ``lastEditedAt`` is the edit clock ``at_closure`` needs.
+_REVIEW_LAST_EDITED_QUERY = """
+query ($owner: String!, $name: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviews(first: 100, after: $cursor) {
+        nodes { id lastEditedAt }
+        pageInfo { hasNextPage endCursor }
+      }
+    }
+  }
+}
+""".strip()
+_EDIT_STAMP_KEYS = ("updated_at", "lastEditedAt", "last_edited_at")
+# Copied onto a snapshot item whose current body is later than the closure
+# boundary.  The original text is not recoverable from the API; consumers
+# must not parse that body as as-of-closure evidence.  Identity (id, author,
+# head, review association, path, line) still is.
+BODY_AS_OF_CLOSURE = "body_as_of_closure"
+# A Codex review submitted before closure whose summary was edited after it and
+# which has no surviving inline findings.  Its id, head and ``submitted_at``
+# prove a round was consumed; its verdict is unrecoverable, so it is neither
+# ``clean`` nor ``findings`` and never closes review.
+UNKNOWN_REVIEW_RESULT = "unknown"
 
 
 def required_env(name: str) -> str:
@@ -827,6 +876,83 @@ class GitHubApi(JsonApi):
             if len(batch) < 100:
                 return items
             page += 1
+
+    def graphql(
+        self, query: str, variables: Mapping[str, Any] | None = None
+    ) -> Mapping[str, Any]:
+        result = self.request(
+            "POST",
+            "graphql",
+            payload={"query": query, "variables": dict(variables or {})},
+        )
+        if not isinstance(result, Mapping):
+            raise TypeError("POST graphql did not return an object")
+        if result.get("errors"):
+            # Never echo the payload: GraphQL errors can quote private titles.
+            raise RuntimeError("POST graphql returned errors")
+        data = result.get("data")
+        if not isinstance(data, Mapping):
+            raise TypeError("POST graphql returned no data")
+        return data
+
+    def review_last_edited_at(self, pr_number: int) -> dict[str, str]:
+        """GraphQL ``lastEditedAt`` keyed by REST ``node_id``.
+
+        REST ``pulls/{n}/reviews`` has ``submitted_at`` and no ``updated_at``,
+        even though the summary body remains editable.  GraphQL ``databaseId``
+        is a 32-bit int and overflows real review ids, so the opaque ``id``
+        (REST ``node_id``) is the join.  A never-edited review is omitted
+        (null ``lastEditedAt``).
+        """
+        owner, sep, name = self.repository.partition("/")
+        if not sep or not owner or not name:
+            raise RuntimeError(
+                f"repository {self.repository!r} is not owner/name for GraphQL"
+            )
+        times: dict[str, str] = {}
+        cursor: str | None = None
+        while True:
+            data = self.graphql(
+                _REVIEW_LAST_EDITED_QUERY,
+                {
+                    "owner": owner,
+                    "name": name,
+                    "number": int(pr_number),
+                    "cursor": cursor,
+                },
+            )
+            repository = data.get("repository")
+            if not isinstance(repository, Mapping):
+                return times
+            pull_request = repository.get("pullRequest")
+            if not isinstance(pull_request, Mapping):
+                return times
+            connection = pull_request.get("reviews")
+            if not isinstance(connection, Mapping):
+                return times
+            nodes = connection.get("nodes")
+            if isinstance(nodes, list):
+                for node in nodes:
+                    if not isinstance(node, Mapping):
+                        continue
+                    node_id = node.get("id")
+                    edited = node.get("lastEditedAt")
+                    if (
+                        isinstance(node_id, str)
+                        and node_id.strip()
+                        and isinstance(edited, str)
+                        and edited.strip()
+                    ):
+                        times[node_id] = edited
+            page = connection.get("pageInfo")
+            if not (
+                isinstance(page, Mapping)
+                and page.get("hasNextPage")
+                and isinstance(page.get("endCursor"), str)
+                and page["endCursor"]
+            ):
+                return times
+            cursor = str(page["endCursor"])
 
 
 class SlackApi(JsonApi):
@@ -2151,7 +2277,9 @@ def review_findings(
     ``commit_id`` filter mixes leftover rounds into the current verdict.
 
     The comment list is fetched once and filtered per review, so building a
-    whole-PR round history costs no additional API calls.
+    whole-PR round history costs no additional API calls.  A comment whose
+    body is not as-of-closure keeps ``body_as_of_closure=False`` on the
+    finding so severity is not invented from the cleared text.
     """
     findings: list[dict[str, Any]] = []
     for comment in comments:
@@ -2160,13 +2288,16 @@ def review_findings(
             continue
         if comment.get("pull_request_review_id") != review_id:
             continue
-        findings.append(
-            {
-                "path": comment.get("path") or "?",
-                "line": comment.get("line") or comment.get("original_line") or "?",
-                "body": str(comment.get("body") or ""),
-            }
-        )
+        finding: dict[str, Any] = {
+            "path": comment.get("path") or "?",
+            "line": comment.get("line") or comment.get("original_line") or "?",
+            "body": str(comment.get("body") or ""),
+        }
+        # A post-closure edit clears the body.  Keep the marker so
+        # ``severity_counts`` does not invent P3 from the empty string.
+        if comment.get(BODY_AS_OF_CLOSURE) is False:
+            finding[BODY_AS_OF_CLOSURE] = False
+        findings.append(finding)
     return findings
 
 
@@ -2452,6 +2583,10 @@ def severity_counts(findings: Sequence[Mapping[str, Any]]) -> dict[str, int]:
         # history packet reports the counts this wake publishes, so a badge
         # read two ways here is the KRA-1222 drift rebuilt in the severity
         # column.  P0 folds into P1 and an unbadged comment takes P3 there.
+        # An untrusted (post-closure-edited) body is not unbadged: the original
+        # level is gone, and the empty string must not become P3.
+        if finding.get(BODY_AS_OF_CLOSURE) is False:
+            continue
         level = finding_severity(str(finding.get("body") or ""))
         counts[f"p{level}"] += 1
     return counts
@@ -2577,6 +2712,30 @@ def result_event_identity(channel: str, record: Mapping[str, Any]) -> str:
     return f"{channel}:{text}" if text else ""
 
 
+def _review_id_from_event_identity(identity: str) -> int | None:
+    """The review id a ``review:<id>`` result identity names, if any."""
+    prefix = "review:"
+    if not identity.startswith(prefix):
+        return None
+    try:
+        return int(identity[len(prefix) :])
+    except ValueError:
+        return None
+
+
+def _untrusted_body_without_inline_findings(
+    item: Mapping[str, Any], inline_findings: Sequence[Any] | None
+) -> bool:
+    """True when identity is kept but the item cannot be dated as a verdict.
+
+    A post-closure edit clears the body.  Surviving inline comments still
+    classify the round; with none, the review enters the result stream as
+    ``UNKNOWN_REVIEW_RESULT`` — the round was consumed, its verdict is not
+    known — and must not be the history selector's latest review for the head.
+    """
+    return item.get(BODY_AS_OF_CLOSURE) is False and not inline_findings
+
+
 def codex_result_events(
     github: GitHubApi,
     reviews: Sequence[Mapping[str, Any]],
@@ -2638,17 +2797,24 @@ def codex_result_events(
     events: list[ResultEvent] = []
     inline_comments = review_comments
 
-    def review_kind(review: Mapping[str, Any], body: str, head_sha: str) -> str:
+    def inline_findings_for(review: Mapping[str, Any]) -> list[dict[str, Any]] | None:
+        """Matching inline findings, or ``None`` when the review id cannot bind."""
         nonlocal inline_comments
-        if not clean_verdict_binds_head(body, head_sha):
-            return "findings"
         try:
             review_id = int(review["id"])
         except (KeyError, TypeError, ValueError):
-            return "findings"
+            return None
         if inline_comments is None:
             inline_comments = github.paginate(f"pulls/{pr_number}/comments")
-        if review_findings(inline_comments, review_id, codex_login):
+        return review_findings(inline_comments, review_id, codex_login)
+
+    def review_kind(review: Mapping[str, Any], body: str, head_sha: str) -> str:
+        if not clean_verdict_binds_head(body, head_sha):
+            return "findings"
+        findings = inline_findings_for(review)
+        if findings:
+            return "findings"
+        if findings is None:
             return "findings"
         return "clean"
 
@@ -2662,12 +2828,25 @@ def codex_result_events(
         if not head_sha:
             continue
         body = str(review.get("body") or "")
+        if review.get(BODY_AS_OF_CLOSURE) is False:
+            # Summary text is a post-closure edit.  Classify from pre-closure
+            # inline comments; with none, the review cannot be dated as a
+            # verdict — but its id, head and submission time still prove the
+            # round, so it is kept as a non-closing unknown result rather than
+            # dropped, and never read as CLEAN or as a findings round.
+            inlines = inline_findings_for(review)
+            if _untrusted_body_without_inline_findings(review, inlines):
+                kind = UNKNOWN_REVIEW_RESULT
+            else:
+                kind = "findings"
+        else:
+            kind = review_kind(review, body, head_sha)
         events.append(
             (
                 result_event_time(review.get("submitted_at")),
                 len(events),
                 head_sha,
-                review_kind(review, body, head_sha),
+                kind,
                 "codex",
                 result_event_identity("review", review),
             )
@@ -2896,11 +3075,25 @@ def latest_result_by_head(
     time cannot carry that proof on their own — GitHub stamps whole seconds, so
     a newer verdict of the same kind in the same second is invisible to both
     (KRA-1368).
+
+    An ``UNKNOWN_REVIEW_RESULT`` wins a head only when nothing else does: its
+    verdict is unrecoverable, so it cannot supersede a known result on the
+    same head, and a known result supersedes it whenever it lands.
     """
     latest: dict[str, tuple[datetime, int, str, str, str]] = {}
     for at, order, head, kind, source, identity in events:
         previous = latest.get(head)
-        if previous is None or (at, order) >= (previous[0], previous[1]):
+        if previous is None:
+            latest[head] = (at, order, kind, source, identity)
+            continue
+        unknown = kind == UNKNOWN_REVIEW_RESULT
+        previous_unknown = previous[2] == UNKNOWN_REVIEW_RESULT
+        if unknown and not previous_unknown:
+            continue
+        if (previous_unknown and not unknown) or (at, order) >= (
+            previous[0],
+            previous[1],
+        ):
             latest[head] = (at, order, kind, source, identity)
     return {
         head: {"kind": kind, "source": source, "at": at, "identity": identity}
@@ -3000,10 +3193,16 @@ def round_history(
     earlier findings review on the same unchanged head, the later CLEAN is
     the verdict.  Reviews are deduplicated by id because the submitted review
     under routing is also present in the paginated list.  Only the latest
-    findings review per head supplies the digest: an earlier review's comments
-    on the same unchanged head are superseded by the later review's own
-    complete assessment (an intervening CLEAN may have resolved them), so
-    merging rounds would hand Theoros findings that are no longer live.
+    findings review per head that entered the result stream supplies the
+    digest: an earlier review's comments on the same unchanged head are
+    superseded by the later review's own complete assessment (an intervening
+    CLEAN may have resolved them), so merging rounds would hand Theoros
+    findings that are no longer live.  A post-closure-edited summary with no
+    surviving inlines is not a digest candidate; when ``latest_results`` names
+    the winning Codex review, that identity is the digest, not a second
+    latest-per-head scan.  Where such a review is the only result on its head,
+    the round is reported as consumed with an unknown verdict: never CLEAN,
+    never closing, no findings invented.
 
     Each head's verdict is read from the producer that actually won it, not
     from whichever record exists.  A head can carry both a Codex review and a
@@ -3023,6 +3222,9 @@ def round_history(
         if not head or review_id is None or int(review_id) in seen_reviews:
             continue
         seen_reviews.add(int(review_id))
+        inlines = review_findings(review_comments, int(review_id), codex_login)
+        if _untrusted_body_without_inline_findings(review, inlines):
+            continue
         candidate = (
             result_event_time(review.get("submitted_at")),
             len(seen_reviews),
@@ -3036,6 +3238,15 @@ def round_history(
         for head, (_, _, review_id) in latest_review_by_head.items()
     }
     latest_result = dict(latest_results or {})
+    # The event stream already chose the review.  Re-selecting latest-per-head
+    # from the unfiltered list lets an omitted review shadow the winner.
+    for head, winner in latest_result.items():
+        if winner.get("source") != "codex":
+            continue
+        named = _review_id_from_event_identity(str(winner.get("identity") or ""))
+        if named is None:
+            continue
+        findings_by_head[head] = review_findings(review_comments, named, codex_login)
     bases = dict(head_bases or {})
     substitute_by_head = _substitute_history_by_head(issue_comments)
     history: list[dict[str, Any]] = []
@@ -3104,6 +3315,13 @@ def round_history(
                     "digest in the verdict comment)"
                 )
                 counts = {"p1": 0, "p2": 0, "p3": 0, "total": 0}
+            locations = []
+        elif kind == UNKNOWN_REVIEW_RESULT:
+            verdict = (
+                "review submitted, summary edited after closure "
+                "(verdict unknown; not evidence of CLEAN)"
+            )
+            counts = severity_counts([])
             locations = []
         elif head not in findings_by_head:
             verdict = "CLEAN (Codex clean comment)"
@@ -3787,6 +4005,15 @@ def exhaustion_gate(
         "3. close or defer the PR.\n\n"
         "A later merge still requires an exact-head clean review, green required "
         "checks, no conflicts, and separate merge authority."
+        + (
+            ""
+            if retrospective_actor() is not None
+            else (
+                f"\n\nRetrospective: held — `{RETROSPECTIVE_ACTOR_ENV}` names no seat "
+                "(Hákon's ruling, 2026-09-07: no exhaustion testimony during the "
+                "thirteen-lanes crunch). The gate stands on its own; nobody is woken."
+            )
+        )
     )
 
 
@@ -4128,6 +4355,8 @@ def build_burn_messages(
     review_round: int,
     history: Sequence[Mapping[str, Any]] | None = None,
     substitute: Mapping[str, Any] | None = None,
+    cast: tuple[str, str] | None = None,
+    effort: str | None = None,
 ) -> list[str]:
     if substitute is None:
         counts = severity_counts(findings)
@@ -4156,10 +4385,15 @@ def build_burn_messages(
         if history
         else "## Finding digest\n"
     )
-    actor = burn_actor()
+    actor, cast_note = cast if cast is not None else (burn_actor(), "")
+    # The bare `Effort:` line is the edge's exact grammar (hive#49); it sits
+    # directly under the envelope so no digest line can be mistaken for it.
+    effort_line = f"Effort: {effort}\n" if effort else ""
+    cast_paragraph = f"{cast_note}\n" if cast_note else ""
     header = (
-        f"WAKE: {actor}\n\n"
+        f"WAKE: {actor}\n{effort_line}\n"
         f"Burn seat `{actor}` — load skill `talos-burn` and burn these findings.\n\n"
+        f"{cast_paragraph}"
         f"{SCOPE_TEST_BURNER}\n\n"
         f"Review-loop hook: {verdict} {MERGE_REGIME}\n\n"
         f"PR: {pr_url}\n"
@@ -4345,10 +4579,12 @@ def build_retrospective_messages(
     author_actor: str,
     review_round: int,
     substitute: Mapping[str, Any] | None = None,
+    actor: str | None = None,
 ) -> list[str]:
-    """Ask Theoros why burning could not close this PR, and what generalises."""
+    """Ask the retrospective seat why burning could not close this PR, and what generalises."""
+    seat = actor or RETROSPECTIVE_ACTOR
     header = (
-        f"WAKE: {RETROSPECTIVE_ACTOR}\n\n"
+        f"WAKE: {seat}\n\n"
         "Review-loop hook: the bounded automatic loop is exhausted — "
         f"{review_round} reviewed head(s) consumed against an automatic bound "
         f"of {MAX_REVIEW_ROUNDS}, and burning did not close this PR. You are "
@@ -4497,6 +4733,24 @@ def publish_exhaustion_retrospective(
     asked, and the chase leg dates its window from it, so a receipt written
     for a wake nobody received would hound a seat that owes nothing.
     """
+    actor = retrospective_actor()
+    if actor is None:
+        # The hold (Hákon, 2026-09-07): the gate stands on its own and nobody
+        # is asked, so no receipt is written and no chase can ever start.
+        print(
+            f"retrospective held for {repository}#{pr_number} (head={head_sha}): "
+            f"{RETROSPECTIVE_ACTOR_ENV} names no seat; the gate stands, nobody is woken"
+        )
+        belt().event(
+            "belt.retrospective.held",
+            **{
+                "logfire.msg": f"#{pr_number} retrospective held",
+                "pull_request": pr_number,
+                "head_sha": head_sha,
+                "rounds_consumed": len(history),
+            },
+        )
+        return
     post_threaded_messages(
         slack,
         build_retrospective_messages(
@@ -4513,6 +4767,7 @@ def publish_exhaustion_retrospective(
             author_actor=author_actor,
             review_round=review_round,
             substitute=substitute,
+            actor=actor,
         ),
         github=github,
         repository=repository,
@@ -4521,7 +4776,7 @@ def publish_exhaustion_retrospective(
         decision="exhaustion_retrospective",
     )
     print(
-        f"woke {RETROSPECTIVE_ACTOR} for {repository}#{pr_number} retrospective "
+        f"woke {actor} for {repository}#{pr_number} retrospective "
         f"(rounds={len(history)})"
     )
     # Once per head, however many times the wake is re-sent.  The retry
@@ -4540,7 +4795,7 @@ def publish_exhaustion_retrospective(
         return
     github.post(
         f"issues/{pr_number}/comments",
-        {"body": retrospective_wake_receipt_body(head_sha, RETROSPECTIVE_ACTOR)},
+        {"body": retrospective_wake_receipt_body(head_sha, actor)},
     )
 
 
@@ -4913,6 +5168,7 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         latest_results=latest_result_by_head(result_events),
         issue_comments=conversation_comments,
     )
+    cast = burn_cast()
     messages = build_burn_messages(
         findings=findings,
         review_state=review_state,
@@ -4926,6 +5182,8 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         author_actor=author_actor,
         review_round=review_round,
         history=history,
+        cast=cast,
+        effort=burn_effort(pr_labels(pr_state)),
     )
     belt_verdict(
         pr_number=pr_number,
@@ -4962,7 +5220,7 @@ def route_review(event: Mapping[str, Any] | None = None) -> None:
         chunks=len(messages),
     ):
         print(
-            f"woke {burn_actor()} for {repository}#{pr_number} "
+            f"woke {cast[0]} for {repository}#{pr_number} "
             f"(findings={len(findings)}, author={author_actor}, "
             f"messages={len(messages)})"
         )
@@ -5515,6 +5773,7 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             ),
             issue_comments=[*conversation_comments, comment],
         )
+        cast = burn_cast()
         messages = build_burn_messages(
             findings=[],
             review_state=f"substitute-findings:{verdict['actor']}",
@@ -5533,6 +5792,8 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
                 "counts": verdict["counts"],
                 "body": str(comment.get("body") or ""),
             },
+            cast=cast,
+            effort=burn_effort(pr_labels(pr_state)),
         )
         counts = verdict["counts"]
         belt_verdict(
@@ -5573,7 +5834,7 @@ def route_substitute_verdict(event: Mapping[str, Any]) -> None:
             chunks=len(messages),
         ):
             print(
-                f"woke {burn_actor()} for {repository}#{pr_number} "
+                f"woke {cast[0]} for {repository}#{pr_number} "
                 f"(substitute findings by {verdict['actor']}, "
                 f"counts={verdict['counts']}, messages={len(messages)})"
             )
@@ -5912,6 +6173,7 @@ def retrospective_chase_wake_message(
     head_sha: str,
     requested_at: datetime,
     pr_state: str = "open",
+    actor: str = RETROSPECTIVE_ACTOR,
 ) -> str:
     """Re-ask for a requested retrospective that never reached the PR.
 
@@ -5937,7 +6199,7 @@ def retrospective_chase_wake_message(
         )
     )
     return (
-        f"WAKE: {RETROSPECTIVE_ACTOR}\n\n"
+        f"WAKE: {actor}\n\n"
         "Review-loop hook: an exhaustion retrospective was requested from you "
         f"at `{stamp}` and no verdict has reached the PR. This is a "
         "redelivery of that one request, not a second one: it carries no "
@@ -5960,7 +6222,9 @@ def retrospective_chase_wake_message(
     )
 
 
-def retrospective_chase_comment_body(head_sha: str, attempt: int) -> str:
+def retrospective_chase_comment_body(
+    head_sha: str, attempt: int, actor: str = RETROSPECTIVE_ACTOR
+) -> str:
     """The durable record of one chase; attempt ``RETROSPECTIVE_CHASE_ATTEMPTS`` names the gap.
 
     The last attempt is deliberately the loud one (R-3): a retrospective that
@@ -5972,7 +6236,7 @@ def retrospective_chase_comment_body(head_sha: str, attempt: int) -> str:
     if attempt < RETROSPECTIVE_CHASE_ATTEMPTS:
         return (
             "Review-loop: the exhaustion retrospective requested for head "
-            f"`{head_sha}` has not been posted here; `{RETROSPECTIVE_ACTOR}` "
+            f"`{head_sha}` has not been posted here; `{actor}` "
             f"was re-woken once (attempt {attempt} of "
             f"{RETROSPECTIVE_CHASE_ATTEMPTS}). Attention only — no review "
             "round, no repair authority, no merge authority.\n"
@@ -5980,7 +6244,7 @@ def retrospective_chase_comment_body(head_sha: str, attempt: int) -> str:
         )
     return (
         "## Exhaustion retrospective not delivered\n\n"
-        f"The review loop asked `{RETROSPECTIVE_ACTOR}` for a structural "
+        f"The review loop asked `{actor}` for a structural "
         f"retrospective on head `{head_sha}` and re-asked once. No verdict "
         "carrying the retrospective marker has reached this PR, so the "
         "testimony behind this PR's exhaustion is unrecorded on the evidence "
@@ -6041,6 +6305,11 @@ def chase_undelivered_retrospective(
     It never gates, repairs, re-reviews, merges, or summons a reviewer
     (KRA-1029's charter); it asks only whether the verdict was delivered.
     """
+    actor = retrospective_actor()
+    if actor is None:
+        # Held: no testimony is owed, so a receipt from before the hold is not
+        # chased either — chasing would hound a seat the ruling excused.
+        return 0
     if retrospective_delivered(comments, head_sha):
         return 0
     requested_at = retrospective_requested_at(comments, head_sha)
@@ -6176,11 +6445,12 @@ def chase_undelivered_retrospective(
                 head_sha=head_sha,
                 requested_at=requested_at,
                 pr_state=pr_state,
+                actor=actor,
             )
         )
     github.post(
         f"issues/{pr_number}/comments",
-        {"body": retrospective_chase_comment_body(head_sha, attempt)},
+        {"body": retrospective_chase_comment_body(head_sha, attempt, actor)},
     )
     print(
         f"chased undelivered retrospective for {repository}#{pr_number} "
@@ -6195,7 +6465,7 @@ def chase_undelivered_retrospective(
             ),
             "pull_request": pr_number,
             "head_sha": head_sha,
-            "retrospective_actor": RETROSPECTIVE_ACTOR,
+            "retrospective_actor": actor,
             "attempt": attempt,
             "max_attempts": RETROSPECTIVE_CHASE_ATTEMPTS,
             "pull_request_state": pr_state,
@@ -6600,6 +6870,8 @@ def redeliver_standing_wake(
             findings=findings,
             review_state=review_state,
             substitute=substitute_payload,
+            cast=burn_cast(),
+            effort=burn_effort(pr_labels(pull_request)),
             pr_url=pr_url,
             branch=branch,
             head_sha=head_sha,
@@ -6684,18 +6956,17 @@ def redeliver_standing_wake(
     return True
 
 
-def usage_meter_reading() -> dict[str, Any] | None:
-    """Read the Codex pool from the AI-usage aggregator; ``None`` means absent.
+def usage_snapshot() -> Mapping[str, Any] | None:
+    """One ``GET /v3/usage`` against the AI-usage aggregator; ``None`` means absent.
 
-    The meter is advisory routing input, never a gate: ANY failure — unset
-    env, network, non-2xx, unparseable body, unknown pool — collapses to
-    ``None`` and the caller behaves exactly as it did before the meter
-    existed.  A dead meter must not add a way for the belt to hang.  The
-    bearer token is used and never returned, logged, or embedded in output.
+    The fetch primitive under every meter read (the Codex find-half meter and
+    the burn cast).  Advisory: unset env, network, non-2xx and an unparseable
+    body all collapse to ``None`` and the caller behaves as if no meter
+    existed.  The bearer token is used and never returned, logged or
+    embedded in output.
     """
     base_url = os.environ.get("AI_USAGE_URL", "").strip().rstrip("/")
     token = os.environ.get("AI_USAGE_READ_TOKEN", "").strip()
-    pool_name = os.environ.get("AI_USAGE_CODEX_POOL", "").strip()
     if not base_url or not token:
         return None
     request = urllib.request.Request(
@@ -6712,7 +6983,23 @@ def usage_meter_reading() -> dict[str, Any] | None:
             payload = json.loads(response.read().decode("utf-8"))
     except Exception:  # noqa: BLE001 - advisory meter: every failure is "absent".
         return None
-    pools = payload.get("pools") if isinstance(payload, Mapping) else None
+    return payload if isinstance(payload, Mapping) else None
+
+
+def usage_meter_reading() -> dict[str, Any] | None:
+    """Read the Codex pool from the AI-usage aggregator; ``None`` means absent.
+
+    The meter is advisory routing input, never a gate: ANY failure — unset
+    env, network, non-2xx, unparseable body, unknown pool — collapses to
+    ``None`` and the caller behaves exactly as it did before the meter
+    existed.  A dead meter must not add a way for the belt to hang.  The
+    bearer token is used and never returned, logged, or embedded in output.
+    """
+    pool_name = os.environ.get("AI_USAGE_CODEX_POOL", "").strip()
+    payload = usage_snapshot()
+    if payload is None:
+        return None
+    pools = payload.get("pools")
     if not isinstance(pools, Sequence):
         return None
     # Schema-3 pool selection: the pool `id` is an opaque identity digest, so
@@ -6761,6 +7048,189 @@ def codex_threshold() -> float:
     return value
 
 
+# --- seat-router (vendored) ------------------------------------------------
+# One fold, two callers: the review loop casts its burn seat with it and the
+# Linear dispatcher casts a ticket's default seat with it.  Both scripts are
+# single-file deployables, so the block is vendored verbatim into each;
+# tests/test_seat_router_vendored.py fails the moment the two copies differ.
+#
+# The input is the AI-usage aggregator's schema-3 ``/v3/usage`` snapshot.  A
+# seat is joined to a pool through the pool's observed profiles: the profile
+# id the collector publishes is ``<seat>-<edge>`` (``gnomon-cx53``,
+# ``talos-cx43``, ``fable-laptop``), so the join is ``id == seat`` or
+# ``id.startswith(seat + "-")``; a seat whose collector names its profile
+# differently is declared once as ``seat=profile-id`` in the override map.
+# A seat no profile matches is *unknown*, never available and never
+# excluded — unobserved is not the same evidence as exhausted (Talos, 2026-09-07:
+# a burn seat that was dry for a day while the belt kept minting to it).
+SEAT_AVAILABILITY_THRESHOLD_DEFAULT = 0.9
+_SEAT_PROFILE_STATE_RANK = {"current": 0, "recent": 1, "stale": 2}
+
+
+def seat_usage_profiles(raw: str) -> dict[str, str]:
+    """``seat=profile-id,seat2=profile-id2`` → ``{seat: profile-id}``.
+
+    Malformed entries (no ``=``, empty side) are dropped; the map is advisory
+    routing input and a typo must not raise inside a wake leg.
+    """
+    profiles: dict[str, str] = {}
+    for entry in raw.split(","):
+        seat, separator, profile_id = entry.strip().partition("=")
+        seat = seat.strip().lower()
+        profile_id = profile_id.strip()
+        if separator and seat and profile_id:
+            profiles[seat] = profile_id
+    return profiles
+
+
+def _seat_matches_profile(
+    seat: str, profile: Mapping[str, Any], override: str | None
+) -> bool:
+    profile_id = str(profile.get("id") or "")
+    if override is not None:
+        return profile_id == override
+    label = str(profile.get("label") or "").strip().lower()
+    return profile_id == seat or profile_id.startswith(f"{seat}-") or label == seat
+
+
+def _pool_peak_window(pool: Mapping[str, Any]) -> tuple[float | None, str | None]:
+    """The most constrained window of a pool: ``(utilization, resets_at)``."""
+    utilization: float | None = None
+    resets_at: str | None = None
+    windows = pool.get("windows")
+    if not isinstance(windows, Sequence):
+        return None, None
+    for window in windows:
+        if not isinstance(window, Mapping):
+            continue
+        value = window.get("utilization")
+        if not isinstance(value, (int, float)) or not 0 <= float(value) <= 1:
+            continue
+        if utilization is None or float(value) > utilization:
+            utilization = float(value)
+            resets = window.get("resets_at")
+            resets_at = str(resets) if resets else None
+    return utilization, resets_at
+
+
+def seat_availability(
+    snapshot: Mapping[str, Any] | None,
+    roster: Sequence[str],
+    *,
+    threshold: float = SEAT_AVAILABILITY_THRESHOLD_DEFAULT,
+    profiles: Mapping[str, str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Per roster seat: ``state`` ∈ available|exhausted|unavailable|unknown.
+
+    ``available``: the joined pool reports ``status == "ok"``, its observing
+    profile is not ``stale``, and the peak window sits under ``threshold``.
+    ``exhausted``: the peak window is at or over ``threshold`` (``resets_at``
+    says when it clears).  ``unavailable``: the pool's status is anything but
+    ``ok`` (``auth_expired``, ``billing_unavailable``, ``error``, ``stale``) or
+    the profile is stale.  ``unknown``: no profile in the snapshot joins the
+    seat.  ``detail`` is a one-clause human reading for the wake (R-3).
+    """
+    override = dict(profiles or {})
+    states: dict[str, dict[str, Any]] = {
+        seat: {
+            "state": "unknown",
+            "utilization": None,
+            "resets_at": None,
+            "detail": "usage unobserved",
+        }
+        for seat in roster
+    }
+    pools = snapshot.get("pools") if isinstance(snapshot, Mapping) else None
+    if not isinstance(pools, Sequence):
+        return states
+    best_rank: dict[str, int] = {}
+    for pool in pools:
+        if not isinstance(pool, Mapping):
+            continue
+        pool_profiles = pool.get("profiles")
+        if not isinstance(pool_profiles, Sequence):
+            continue
+        status = str(pool.get("status") or "unknown")
+        utilization, resets_at = _pool_peak_window(pool)
+        for profile in pool_profiles:
+            if not isinstance(profile, Mapping):
+                continue
+            profile_state = str(profile.get("state") or "current")
+            rank = _SEAT_PROFILE_STATE_RANK.get(profile_state, 3)
+            for seat in roster:
+                if not _seat_matches_profile(seat, profile, override.get(seat)):
+                    continue
+                if seat in best_rank and best_rank[seat] <= rank:
+                    continue
+                best_rank[seat] = rank
+                if status != "ok":
+                    reading = {"state": "unavailable", "detail": status}
+                elif profile_state == "stale":
+                    reading = {"state": "unavailable", "detail": "profile stale"}
+                elif utilization is None:
+                    reading = {"state": "unknown", "detail": "no usage window"}
+                elif utilization >= threshold:
+                    reading = {
+                        "state": "exhausted",
+                        "detail": f"exhausted {utilization:.2f}"
+                        + (f" (resets {resets_at})" if resets_at else ""),
+                    }
+                else:
+                    reading = {"state": "available", "detail": f"ok {utilization:.2f}"}
+                states[seat] = {
+                    **reading,
+                    "utilization": utilization,
+                    "resets_at": resets_at,
+                }
+    return states
+
+
+def cast_seat(
+    roster: Sequence[str],
+    snapshot: Mapping[str, Any] | None,
+    *,
+    cast: str,
+    threshold: float = SEAT_AVAILABILITY_THRESHOLD_DEFAULT,
+    profiles: Mapping[str, str] | None = None,
+) -> tuple[str, str]:
+    """``(actor, note)``: the first roster seat the meter reads as available.
+
+    A roster of at most one seat, or an absent snapshot, is the pre-meter
+    behaviour: the cast seat, no note.  Otherwise roster order is preference:
+    the first ``available`` seat wins; with none, the first ``unknown`` seat
+    (unobserved beats exhausted); with none of those either, the cast seat —
+    named as a fallback, so a wake to a seat the meter could not clear is
+    visibly the meter's failure, not its choice.  The note is the R-3
+    publication of the reading and ends in a newline; an empty note means the
+    meter did not speak.
+    """
+    ordered = [
+        seat for seat in dict.fromkeys(seat.strip().lower() for seat in roster) if seat
+    ]
+    if len(ordered) <= 1 or snapshot is None:
+        return cast, ""
+    states = seat_availability(
+        snapshot, ordered, threshold=threshold, profiles=profiles
+    )
+    reading = " · ".join(f"{seat} {states[seat]['detail']}" for seat in ordered)
+    for seat in ordered:
+        if states[seat]["state"] == "available":
+            return seat, f"Cast by the meter: {reading} → {seat}.\n"
+    for seat in ordered:
+        if states[seat]["state"] == "unknown":
+            return (
+                seat,
+                f"Cast by the meter: {reading} → {seat} (unobserved; no seat reads available).\n",
+            )
+    return cast, (
+        f"Cast by the meter: {reading} → every roster seat is exhausted or "
+        f"unavailable; falling back to the cast seat {cast}.\n"
+    )
+
+
+# --- end seat-router (vendored) --------------------------------------------
+
+
 def normalize_substitute_actor(raw: str) -> str | None:
     """Map a configured actor onto the verdict-marker grammar, or ``None``.
 
@@ -6805,6 +7275,126 @@ def burn_actor() -> str:
             "unroutable burn seat"
         )
     return actor
+
+
+def retrospective_actor() -> str | None:
+    """The seat the exhaustion gate wakes, or ``None`` while the hook is held.
+
+    Unset names the charter seat (``RETROSPECTIVE_ACTOR``).  A hold value
+    posts the human gate and wakes nobody — Hákon's ruling of 2026-09-07 for
+    the thirteen-lanes crunch.  Anything else is a seat name under the same
+    grammar the other two casts use, refused here rather than dead-lettered.
+    """
+    raw = os.environ.get(RETROSPECTIVE_ACTOR_ENV, "").strip()
+    if not raw:
+        return RETROSPECTIVE_ACTOR
+    if raw.lower() in RETROSPECTIVE_HOLD_VALUES:
+        return None
+    actor = normalize_substitute_actor(raw)
+    if actor is None:
+        raise ValueError(
+            f"{RETROSPECTIVE_ACTOR_ENV}={raw!r} is outside the actor grammar "
+            "[a-z0-9-]+ after normalization and is not a hold value "
+            f"({'|'.join(sorted(RETROSPECTIVE_HOLD_VALUES))}); refusing to "
+            "wake an unroutable retrospective seat"
+        )
+    return actor
+
+
+def burn_roster() -> tuple[str, ...]:
+    """``REVIEW_BURN_ROSTER`` in preference order; empty when unset.
+
+    Each name goes through the actor grammar; an unroutable name is refused
+    for the same reason ``burn_actor`` refuses one.
+    """
+    seats: list[str] = []
+    for part in os.environ.get(BURN_ROSTER_ENV, "").split(","):
+        if not part.strip():
+            continue
+        actor = normalize_substitute_actor(part)
+        if actor is None:
+            raise ValueError(
+                f"{BURN_ROSTER_ENV} entry {part!r} is outside the actor grammar "
+                "[a-z0-9-]+ after normalization; refusing an unroutable roster"
+            )
+        if actor not in seats:
+            seats.append(actor)
+    return tuple(seats)
+
+
+def burn_threshold() -> float:
+    raw = os.environ.get(BURN_THRESHOLD_ENV, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return SEAT_AVAILABILITY_THRESHOLD_DEFAULT
+    if not 0 < value <= 1:
+        return SEAT_AVAILABILITY_THRESHOLD_DEFAULT
+    return value
+
+
+def burn_cast() -> tuple[str, str]:
+    """``(actor, note)`` for the next burn wake: the roster read by the meter.
+
+    No roster, or no meter, is the static cast with an empty note — the
+    wake is byte-identical to the pre-roster belt.
+    """
+    cast = burn_actor()
+    roster = burn_roster()
+    if len(roster) <= 1:
+        return cast, ""
+    return cast_seat(
+        roster,
+        usage_snapshot(),
+        cast=cast,
+        threshold=burn_threshold(),
+        profiles=seat_usage_profiles(os.environ.get(SEAT_USAGE_PROFILES_ENV, "")),
+    )
+
+
+def pr_labels(pull_request: Mapping[str, Any] | None) -> list[str]:
+    """Label names on a PR object; tolerant of the list shape and of ``None``."""
+    if not isinstance(pull_request, Mapping):
+        return []
+    labels = pull_request.get("labels")
+    if not isinstance(labels, Sequence):
+        return []
+    return [
+        str(label.get("name") or "")
+        for label in labels
+        if isinstance(label, Mapping) and label.get("name")
+    ]
+
+
+def burn_effort(labels: Sequence[str]) -> str | None:
+    """The ``Effort:`` tier a burn wake carries, or ``None`` for no overlay.
+
+    Exactly one valid ``effort:<tier>`` PR label wins; two distinct tiers are
+    a human ambiguity and yield no overlay (named on stdout, never guessed).
+    With no label, ``REVIEW_BURN_EFFORT`` applies when it names a tier.
+    """
+    requested = sorted(
+        {
+            name[len(EFFORT_LABEL_PREFIX) :].strip().lower()
+            for name in labels
+            if name.lower().startswith(EFFORT_LABEL_PREFIX)
+        }
+    )
+    valid = [tier for tier in requested if tier in WAKE_EFFORT_TIERS]
+    if len(valid) > 1:
+        print(f"effort labels ambiguous ({', '.join(valid)}); no overlay applied")
+        return None
+    if len(valid) == 1:
+        return valid[0]
+    raw = os.environ.get(BURN_EFFORT_ENV, "").strip().lower()
+    if not raw:
+        return None
+    if raw not in WAKE_EFFORT_TIERS:
+        print(
+            f"{BURN_EFFORT_ENV}={raw!r} is not a tier ({'|'.join(WAKE_EFFORT_TIERS)}); ignored"
+        )
+        return None
+    return raw
 
 
 def quota_refusal_is_latest_codex_signal(
@@ -7590,20 +8180,88 @@ def skills_changed_since(github: GitHubApi, since: datetime) -> bool:
     return False
 
 
-def send_skill_audit() -> None:
+def _skill_audit_run_started(run: Mapping[str, Any]) -> datetime | None:
+    raw = run.get("created_at")
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = parse_github_time(raw.strip())
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed
+
+
+def skill_audit_window_start(
+    github: GitHubApi,
+    *,
+    now: datetime,
+    current_run_id: str,
+) -> tuple[datetime, str]:
+    """Start the window at the previous successful skill-audit run.
+
+    The routine's own run record is the watermark: no Slack history, no
+    committed marker, no second store to drift.  A run that failed never
+    advances it, so a failure widens the next window instead of dropping the
+    skill commits it missed.  A successful run that posted nothing is still
+    coverage — it looked and found no skill-corpus commits.  Overlap is the
+    safe direction: a commit audited twice is noise, a commit audited never
+    is the hole this exists to close.
+    """
+    page = 1
+    per_page = 100
+    try:
+        while True:
+            payload = github.get(
+                f"actions/workflows/{SKILL_AUDIT_WORKFLOW_FILE}/runs",
+                query={"status": "success", "per_page": per_page, "page": page},
+            )
+            entries = (
+                payload.get("workflow_runs") if isinstance(payload, Mapping) else None
+            )
+            if not isinstance(entries, list) or not entries:
+                break
+            for run in entries:
+                if not isinstance(run, Mapping):
+                    continue
+                if str(run.get("id")) == str(current_run_id):
+                    continue
+                started = _skill_audit_run_started(run)
+                if started is not None:
+                    return started, "previous successful skill-audit run"
+            if len(entries) < per_page:
+                break
+            page += 1
+    except ApiHttpError as error:
+        if error.status_code != 404:
+            raise
+    return (
+        now - timedelta(days=SKILL_AUDIT_FALLBACK_DAYS),
+        f"{SKILL_AUDIT_FALLBACK_DAYS}-day fallback — no previous successful run",
+    )
+
+
+def send_skill_audit(*, now: datetime | None = None) -> None:
     """Post the weekly one-pass skill-audit wake, or say why not.
 
     Skills are exempt from the per-PR review loop (Hákon's ruling,
     2026-08-21); this single weekly pass is their entire quality gate. A
-    quiet week posts nothing — a wake with no possible work is noise.
+    quiet window posts nothing — a wake with no possible work is noise.
+    The lookback is the previous successful run of this workflow, not a
+    fixed number of days, so a delayed or dropped schedule cannot leave
+    skill commits between two consecutive windows.
     """
     repository = required_env("GITHUB_REPOSITORY")
     github = GitHubApi(required_env("GITHUB_TOKEN"), repository)
-    since = datetime.now(timezone.utc) - timedelta(days=SKILL_AUDIT_WINDOW_DAYS)
+    moment = datetime.now(timezone.utc) if now is None else now
+    since, source = skill_audit_window_start(
+        github, now=moment, current_run_id=current_run_id()
+    )
+    since_stamp = since.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+    now_stamp = moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
     if not skills_changed_since(github, since):
         print(
             f"no skill-corpus commits in {repository} since "
-            f"{since.date()} - skipping the audit wake"
+            f"{since_stamp} ({source}) - skipping the audit wake"
         )
         return
     slack = SlackApi(required_env("HIVE_BOT_TOKEN"), required_env("HIVE_CHANNEL"))
@@ -7615,7 +8273,8 @@ def send_skill_audit() -> None:
         "exempt from per-PR Codex review (Hákon's ruling, 2026-08-21); this "
         "audit is their entire quality gate.\n\n"
         f"Repo: `{repository}`. Audit every skill file under {roots} "
-        f"changed in the last {SKILL_AUDIT_WINDOW_DAYS} days "
+        f"changed since {since_stamp} "
+        f"({source}; window {since_stamp} → {now_stamp}) "
         "(`git log --since` over those roots on the default branch), judged "
         "once against `writing-skills`. Land repairs as direct commits or "
         "follow-up tickets. One pass means one pass: no re-review, no burn "
@@ -7628,9 +8287,135 @@ def send_skill_audit() -> None:
         **{
             "logfire.msg": f"weekly skill audit woke `{actor}`",
             "audit_actor": actor,
-            "window_days": SKILL_AUDIT_WINDOW_DAYS,
+            "window_since": since_stamp,
+            "window_until": now_stamp,
+            "window_source": source,
         },
     )
+
+
+def _parse_stamp(raw: Any) -> datetime | None:
+    """A GitHub timestamp, or ``None`` when missing or unparseable."""
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        parsed = parse_github_time(raw.strip())
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _item_edit_time(item: Mapping[str, Any]) -> datetime | None:
+    """When the item's current body last changed, if GitHub exposes that clock.
+
+    REST issue and review comments carry ``updated_at``. REST pull-request
+    reviews do not; GraphQL ``lastEditedAt`` (copied onto the review, or
+    present under that name) is the same clock on that channel.
+    """
+    for key in _EDIT_STAMP_KEYS:
+        parsed = _parse_stamp(item.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _edit_clock_proves_an_edit(
+    item: Mapping[str, Any], edited: datetime | None, when: datetime | None
+) -> bool:
+    """True when GitHub's clocks prove the current body is not the original.
+
+    GraphQL ``lastEditedAt`` is omitted on a never-edited review, so a
+    parseable value is the proof even when it equals ``submitted_at``
+    (submit and edit sharing a whole second). REST comment ``updated_at``
+    is always present, so the proof there is that it differs from the
+    creation stamp.
+    """
+    if _parse_stamp(item.get("lastEditedAt") or item.get("last_edited_at")) is not None:
+        return True
+    return edited is not None and when is not None and edited != when
+
+
+def _edit_is_after_closure(
+    item: Mapping[str, Any], when: datetime | None, boundary: datetime
+) -> bool:
+    """True when the current body is not the body as of ``boundary``.
+
+    GitHub timestamps are whole seconds.  An item edited in the close or
+    merge second compares equal to the boundary under a strict ``>`` and
+    would keep the current body.  Equality with the boundary is therefore
+    not-as-of-closure when the clocks prove an edit.
+    """
+    edited = _item_edit_time(item)
+    if edited is None:
+        return False
+    if edited > boundary:
+        return True
+    return edited == boundary and _edit_clock_proves_an_edit(item, edited, when)
+
+
+def _with_untrusted_body(item: Mapping[str, Any]) -> dict[str, Any]:
+    """Keep identity; the current body is not as-of-closure evidence."""
+    return {**item, "body": "", BODY_AS_OF_CLOSURE: False}
+
+
+def with_review_edit_times(
+    github: GitHubApi, pr_number: int, reviews: Sequence[Any]
+) -> list[Any]:
+    """Copy GraphQL ``lastEditedAt`` onto REST reviews as ``updated_at``.
+
+    ``lastEditedAt`` is kept too: it is omitted unless the review was
+    edited, which is the proof ``at_closure`` needs when that clock equals
+    ``submitted_at``.  Test stand-ins that do not implement
+    ``review_last_edited_at`` are left unchanged; they can still put
+    ``lastEditedAt`` on the review object for ``at_closure`` to read.
+    """
+    fetch = getattr(github, "review_last_edited_at", None)
+    if not callable(fetch):
+        return list(reviews)
+    times = fetch(pr_number)
+    if not isinstance(times, Mapping) or not times:
+        return list(reviews)
+    enriched: list[Any] = []
+    for item in reviews:
+        if not isinstance(item, Mapping):
+            enriched.append(item)
+            continue
+        if _parse_stamp(item.get("updated_at")) is not None:
+            enriched.append(item)
+            continue
+        node_id = item.get("node_id")
+        review_id = item.get("id")
+        edited = None
+        if isinstance(node_id, str) and node_id in times:
+            edited = times[node_id]
+        elif review_id in times:
+            edited = times[review_id]
+        if _parse_stamp(edited) is None:
+            enriched.append(item)
+            continue
+        # Keep ``lastEditedAt`` as well as ``updated_at``.  Copying only the
+        # REST key would collapse GraphQL's "present iff edited" clock into
+        # comment ``updated_at`` (always present), and a submit-and-edit in
+        # the close second would then look never-edited.
+        enriched.append({**item, "updated_at": edited, "lastEditedAt": edited})
+    return enriched
+
+
+def reviews_as_of_closure(
+    github: GitHubApi, pr_number: int, closed_at: str
+) -> list[Any]:
+    """Reviews in the closure snapshot, with REST's missing edit clock filled in.
+
+    Both terminal readers use this so a GraphQL enrichment cannot apply at
+    one cut and not the other.  An open PR has no boundary, so the extra
+    fetch is skipped.
+    """
+    reviews = github.paginate(f"pulls/{pr_number}/reviews")
+    if closed_at:
+        reviews = with_review_edit_times(github, pr_number, reviews)
+    return at_closure(reviews, closed_at, "submitted_at")
 
 
 def at_closure(items: Sequence[Any], closed_at: str, *stamp_keys: str) -> list[Any]:
@@ -7647,6 +8432,23 @@ def at_closure(items: Sequence[Any], closed_at: str, *stamp_keys: str) -> list[A
     missing or unparseable is kept for the same reason the result stream sorts
     it first: an undated event is not evidence that it arrived after the
     closure.  The first ``stamp_keys`` entry that parses is the item's time.
+
+    GitHub returns a comment's CURRENT body.  An item whose edit clock
+    (``updated_at``, or ``lastEditedAt`` on a pull-request review) is later
+    than the boundary is therefore not as-of-closure, even when ``created_at``
+    (or another stamp in ``stamp_keys``) is earlier: trusting that body would
+    let a post-closure edit rewrite the snapshot's rounds, findings and
+    exhaustion.  The original body is not recoverable from the API, so it is
+    cleared and marked ``body_as_of_closure=False``.  The item itself is
+    kept: dropping it unbinds pre-closure inline comments from their review
+    and lets a clean-looking summary reclassify a findings round as CLEAN.
+
+    GitHub timestamps are whole seconds.  An edit in the same second as close
+    or merge compares equal to the boundary under a strict ``>`` and would
+    keep the current body.  When the clocks prove an edit — GraphQL
+    ``lastEditedAt`` is present, or the REST edit clock differs from the
+    creation stamp — equality with the boundary is treated as
+    not-as-of-closure.
     """
     if not closed_at:
         return list(items)
@@ -7655,17 +8457,18 @@ def at_closure(items: Sequence[Any], closed_at: str, *stamp_keys: str) -> list[A
     for item in items:
         if not isinstance(item, Mapping):
             continue
-        stamps = [item.get(key) for key in stamp_keys]
-        when = next(
-            (
-                result_event_time(stamp)
-                for stamp in stamps
-                if isinstance(stamp, str) and stamp.strip()
-            ),
-            None,
-        )
-        if when is None or when <= boundary:
-            kept.append(item)
+        when = None
+        for key in stamp_keys:
+            parsed = _parse_stamp(item.get(key))
+            if parsed is not None:
+                when = parsed
+                break
+        if when is not None and when > boundary:
+            continue
+        if _edit_is_after_closure(item, when, boundary):
+            kept.append(_with_untrusted_body(item))
+            continue
+        kept.append(item)
     return kept
 
 
@@ -7707,9 +8510,7 @@ def pr_belt_summary(
     head = pull_request.get("head")
     head_sha = str(head["sha"]) if isinstance(head, Mapping) else ""
     closed_at = str(pull_request.get("closed_at") or "")
-    reviews = at_closure(
-        github.paginate(f"pulls/{pr_number}/reviews"), closed_at, "submitted_at"
-    )
+    reviews = reviews_as_of_closure(github, pr_number, closed_at)
     conversation = at_closure(
         github.paginate(f"issues/{pr_number}/comments"), closed_at, "created_at"
     )
