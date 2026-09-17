@@ -7,7 +7,7 @@
 	"license": "MIT",
 	"repository": {
 		"type": "git",
-		"url": "https://github.com/RationallyPrime/morphe.git"
+		"url": "https://github.com/Skrates/morphe.git"
 	},
 	"publishConfig": {
 		"registry": "https://registry.npmjs.org",

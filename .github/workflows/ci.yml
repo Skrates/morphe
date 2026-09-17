@@ -185,23 +185,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: astral-sh/setup-uv@v5
+      # The Estate's one public toolchain pin: the action's own mise.toml names
+      # the uv/ruff/ty versions, and this workflow names only the action commit.
+      # Public repos run GitHub-hosted so fork PRs never execute on Weave metal.
+      - uses: Skrates/agent-affordances/toolchain@5613475f9d2d50d23b97e32669858f7f24a727d1
         with:
-          enable-cache: true
+          tools: uv ruff ty
 
       - run: uv sync --dev --extra service
 
       - name: Tests (pytest)
         run: uv run pytest
 
-      # PINS in lockstep with weave-doctrine's mise.toml (private repo —
-      # unreadable from GitHub-hosted runners). Public repos run GitHub-hosted
-      # so fork PRs never execute on Weave metal; the pins stay.
       - name: Lint (ruff)
-        run: uvx ruff@0.16.1 check
+        run: ruff check
 
       - name: Types (ty)
-        run: uvx ty@0.0.63 check
+        run: ty check
 
       - name: Schema artifacts are byte-stable
         run: |

@@ -1,7 +1,7 @@
 # Issue tracker: Linear
 
 Issues and PRDs for this repo live in **Linear**, not GitHub. The GitHub remote
-(`RationallyPrime/morphe`) is for code only — **do not** `gh issue create`. Use the
+(`Skrates/morphe`) is for code only — **do not** `gh issue create`. Use the
 **`linear` MCP tools** for all issue operations.
 
 ## Coordinates
