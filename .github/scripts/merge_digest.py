@@ -27,7 +27,7 @@ account in front of him while a revert is still one command.
 The gate half of every entry is read through ``review_loop`` — the same
 resolution the review-loop hook publishes.  Two audit trails that can disagree
 are worse than one, so this file contains no second implementation of exact-head
-verdict resolution, finding counts, or round numbering.
+verdict resolution, finding counts, round numbering, or exhaustion.
 
 Standard library only, like its sibling: the cx53 self-hosted runners have a
 deliberately small tool surface.
@@ -498,13 +498,12 @@ def gate_report(
     number = int(pull["number"])
     merged_head = str((pull.get("head") or {}).get("sha") or "").lower()
     # Pre-merge evidence only: a later verdict cannot rewrite the gate record.
-    # The cut is ``review_loop.at_closure`` — the same one the belt summary
-    # measures its own closure with, so the digest and the belt cannot report
-    # different histories for one PR.
+    # Reviews go through ``reviews_as_of_closure`` (REST has no ``updated_at``;
+    # GraphQL ``lastEditedAt`` fills it). Issue and inline comments go through
+    # ``at_closure`` directly. Both readers share those helpers, so the digest
+    # and the belt cannot report different histories for one PR.
     merged_at = str(pull.get("merged_at") or "")
-    reviews = review_loop.at_closure(
-        github.paginate(f"pulls/{number}/reviews"), merged_at, "submitted_at"
-    )
+    reviews = review_loop.reviews_as_of_closure(github, number, merged_at)
     review_comments = review_loop.at_closure(
         github.paginate(f"pulls/{number}/comments"), merged_at, "created_at"
     )
@@ -534,18 +533,10 @@ def gate_report(
     burned = sum(
         row["counts"]["total"] for row in history if row["head"] != merged_head
     )
-    # The merged head is checked explicitly: a fourth unreviewed head merged by
-    # human override never appears in ``history`` (it has no Codex result
-    # event), yet its exhaustion marker is precisely the gate fact to report.
-    marker_heads = {row["head"] for row in history} | (
-        {merged_head} if merged_head else set()
-    )
-    exhausted = any(
-        review_loop.marker_comment_exists(
-            issue_comments, review_loop.exhaustion_marker(head)
-        )
-        for head in marker_heads
-    )
+    # Same predicate as ``pr_belt_summary``: any trusted marker the helper
+    # still recognises (legacy form, or a versioned marker under an earlier
+    # round bound). Regenerating today's writer form here is a second reader.
+    exhausted = review_loop.exhaustion_gate_recorded(issue_comments)
     return {
         "merged_head": merged_head,
         "rounds": len(history),
@@ -1339,7 +1330,7 @@ def run_digest(*, dry_run: bool = False, since_override: str | None = None) -> N
     token = required_env("WEAVE_DIGEST_TOKEN")
     codex_login = os.environ.get("CODEX_LOGIN", review_loop.CODEX_LOGIN)
     now = datetime.now(timezone.utc)
-    self_repo = os.environ.get("GITHUB_REPOSITORY", "RationallyPrime/weave-doctrine")
+    self_repo = os.environ.get("GITHUB_REPOSITORY", "Skrates/weave-doctrine")
     run_id = os.environ.get("GITHUB_RUN_ID", "")
     parsed_override: datetime | None = None
     if since_override:
